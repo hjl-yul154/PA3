@@ -20,17 +20,12 @@
 #include <mpi.h>
 using namespace std;
 
+double *alloc1D(int m,int n);
 void repNorms(double l2norm, double mx, double dt, int m,int n, int niter, int stats_freq);
 void stats(double *E, int m, int n, double *_mx, double *sumSq);
 void printMat2(const char mesg[], double *E, int m, int n);
-double *alloc1D(int m,int n);
-
-#define TAG_TOP 0
-#define TAG_BOTTOM 1
-#define TAG_LEFT 2
-#define TAG_RIGHT 3
-
-
+void solveGivenSingleProcess(double **_E, double **_E_prev, double *R, double alpha, double dt, Plotter *plotter, double &L2, double &Linf);
+void solveWithMPI(double **_E, double **_E_prev, double *R, double alpha, double dt, Plotter *plotter, double &L2, double &Linf);
 extern control_block cb;
 
 // #ifdef SSE_VEC
@@ -44,397 +39,257 @@ extern control_block cb;
 // and then taking the sequare root of the result
 //
 double L2Norm(double sumSq){
-    double l2norm = sumSq /  (double) ((cb.m)*(cb.n));
-    l2norm = sqrt(l2norm);
-    return l2norm;
-}
-
-void copy_mat(double *m1, double *m2, int stride, int n){
-    for (int i=0;i<n;i++){
-        m2[i*stride]=m1[i*stride];
-    }
-}
-
-void stats_mpi(double *E, int rank, int cm, int cn, int stride, double *_mx, double *sumSq){
-     double mx = -1;
-     double _sumSq = 0;
-     for (int i=0;i<cm;i++){
-         for(int j=0;j<cn;j++){
-             int _index=(i+1)*stride+(j+1);
-             _sumSq+=E[_index]*E[_index];
-             double fe= fabs(E[_index]);
-             if(fe>mx){
-                 mx=fe;
-             }
-         }
-     }
-     
-     MPI_Reduce(rank == 0 ? MPI_IN_PLACE :&mx,&mx,1,MPI_DOUBLE,MPI_MAX,0,MPI_COMM_WORLD);
-     MPI_Reduce(rank == 0 ? MPI_IN_PLACE :&_sumSq,&_sumSq,1,MPI_DOUBLE,MPI_SUM,0,MPI_COMM_WORLD);
-     *_mx=mx;
-     *sumSq=_sumSq;
-}
-
-void prepare_scatter_matrix(double *m1, double *m2,int px, int py, int x_b, int y_b, int bm, int bn, int stride){
-    int m1_offset,m2_offset;
-    for (int idx=0;idx<px;idx++){
-        for (int idy=0;idy<py;idy++){
-            m2_offset=((idx*py)+idy)*bm*bn;
-            int addx = (idx < x_b)? 0 : (idx - x_b);
-            int addy = (idy < y_b)? 0 : (idy - y_b);
-            int prevx = (idx < x_b) ? idx : x_b;
-            int prevy = (idy < y_b) ? idy : y_b;
-            int cm = idx < x_b ? bm : (bm - 1);
-            int cn = idy < y_b ? bn : (bn - 1);
-            m1_offset = (prevx * bm + addx * (bm - 1) + 1) * stride + (prevy * bn + addy * (bn - 1)) + 1;
-            for (int i=0;i<cm;i++){
-                for (int j=0;j<cn;j++){
-                    m2[m2_offset+i*bn+j]=m1[m1_offset+i*stride+j];
-                }
-            }
-        }
-    }
+	double l2norm = sumSq /  (double) ((cb.m)*(cb.n));
+	l2norm = sqrt(l2norm);
+	return l2norm;
 }
 
 
-void scatter_mpi(double *E, double *E_curr, double *R, double *R_curr, int rank, int px, int py, int x_b, int y_b,int bm, int bn, int stride){
-    double *E_scatter=alloc1D(px*bm,py*bn);
-    double *R_scatter=alloc1D(px*bm,py*bn);
-    double *E_recv_scatter=alloc1D(bm,bn);
-    double *R_recv_scatter=alloc1D(bm,bn);
-    if (rank==0){
-        prepare_scatter_matrix(E,E_scatter,px,py,x_b,y_b,bm,bn,stride);
-        prepare_scatter_matrix(R,R_scatter,px,py,x_b,y_b,bm,bn,stride);
-    }
-
-    // if (rank==0){
-    // for (int i=0;i<px*bm;i++){
-    //     for(int j=0;j<py*bn;j++){
-    //         cout<<E_scatter[i*(py*bn)+j]<<";";
-    //     }
-    //     cout<<"\n";
-    // }
-    // cout<<"\n";
-    // }
-
-    MPI_Scatter(E_scatter,bm*bn,MPI_DOUBLE,E_recv_scatter,bm*bn,MPI_DOUBLE,0,MPI_COMM_WORLD);
-    MPI_Scatter(R_scatter,bm*bn,MPI_DOUBLE,R_recv_scatter,bm*bn,MPI_DOUBLE,0,MPI_COMM_WORLD);
-
-    // if (rank==1){
-    // for (int i=0;i<bm+2;i++){
-    //     for(int j=0;j<bn+2;j++){
-    //         cout<<E_recv_scatter[i*(bn+2)+j]<<";";
-    //     }
-    //     cout<<"\n";
-    // }
-    // cout<<"\n";
-    // }
-
-    for (int i=0;i<bm;i++){
-        for (int j=0;j<bn;j++){
-            E_curr[(i+1)*(bn+2)+j+1]=E_recv_scatter[i*bn+j];
-            R_curr[(i+1)*(bn+2)+j+1]=R_recv_scatter[i*bn+j];
-        }
-    }
-
-    // for (int i=0;i<bm+2;i++){
-    //     for(int j=0;j<bn+2;j++){
-    //         cout<<E_curr[i*(bn+2)+j]<<";";
-    //     }
-    //     cout<<"\n";
-    // }
-    // cout<<"\n";
-}
-
-#define RANKID(idx,idy,row_stride) ((idx)*(row_stride)+(idy))
-
-void Communicate(double *e_prev, int idx, int idy, int px, int py, int bm, int bn, int cm, int cn){
-    MPI_Request recv_req[4], send_req[4];
-    MPI_Status recv_status[4], send_status[4];
-    int stride=bn+2;
-    MPI_Datatype col_data;
-    MPI_Type_vector(cm,1,stride,MPI_DOUBLE,&col_data);
-    MPI_Type_commit(&col_data);
-    
-    if (idx==0){
-        copy_mat(e_prev+2*stride+1,e_prev+1,1,cn);
-    }
-    else{
-        MPI_Isend(e_prev+stride+1,cn,MPI_DOUBLE,RANKID(idx-1,idy,py),TAG_TOP,MPI_COMM_WORLD,&send_req[0]);
-        MPI_Irecv(e_prev+1,cn,MPI_DOUBLE,RANKID(idx-1,idy,py),TAG_BOTTOM,MPI_COMM_WORLD,&recv_req[0]);
-    }
-
-    if (idx==px-1){
-        copy_mat(e_prev+(cm-1)*stride+1,e_prev+(cm+1)*stride+1,1,cn);
-    }
-    else{
-        MPI_Isend(e_prev+cm*stride+1,cn,MPI_DOUBLE,RANKID(idx+1,idy,py),TAG_BOTTOM,MPI_COMM_WORLD,&send_req[1]);
-        MPI_Irecv(e_prev+(cm+1)*stride+1,cn,MPI_DOUBLE,RANKID(idx+1,idy,py),TAG_TOP,MPI_COMM_WORLD,&recv_req[1]);
-    }
-
-    if (idy==0){
-        copy_mat(e_prev+2+stride,e_prev+stride,stride,cm);
-    }
-    else{
-        MPI_Isend(e_prev+1+stride,1,col_data,RANKID(idx,idy-1,py),TAG_LEFT,MPI_COMM_WORLD,&send_req[2]);
-        MPI_Irecv(e_prev+stride,1,col_data,RANKID(idx,idy-1,py),TAG_RIGHT,MPI_COMM_WORLD,&recv_req[2]);
-    }
-
-    if (idy==py-1){
-        copy_mat(e_prev+cn-1+stride,e_prev+cn+1+stride,stride,cm);
-    }
-    else{
-        MPI_Isend(e_prev+cn+stride,1,col_data,RANKID(idx,idy+1,py),TAG_RIGHT,MPI_COMM_WORLD,&send_req[3]);
-        MPI_Irecv(e_prev+cn+1+stride,1,col_data,RANKID(idx,idy+1,py),TAG_LEFT,MPI_COMM_WORLD,&recv_req[3]);
-    }
-
-    if(idx>0){
-        MPI_Wait(&send_req[0],&send_status[0]);
-        MPI_Wait(&recv_req[0],&recv_status[0]);
-    }
-    if (idx<px-1){
-        MPI_Wait(&send_req[1],&send_status[1]);
-        MPI_Wait(&recv_req[1],&recv_status[1]);
-    }
-    if(idy>0){
-        MPI_Wait(&send_req[2],&send_status[2]);
-        MPI_Wait(&recv_req[2],&recv_status[2]);
-    }
-    if(idy<py-1){
-        MPI_Wait(&send_req[3],&send_status[3]);
-        MPI_Wait(&recv_req[3],&recv_status[3]);
-    }
-
-}
-void compute_AP(double *E, double *E_prev, double *R, double alpha, double dt, int stride, int cm, int cn){
-    int innerBlockRowStartIndex=stride+1;
-    int innerBlockRowEndIndex=cm*stride+1;
-#ifdef FUSED
-    // Solve for the excitation, a PDE
-    for(int j = innerBlockRowStartIndex; j <= innerBlockRowEndIndex; j+=stride) {
-        double *E_tmp = E + j;
-	    double *E_prev_tmp = E_prev + j;
-        double *R_tmp = R + j;
-        for(int i = 0; i < cn; i++) {
-            E_tmp[i] = E_prev_tmp[i]+alpha*(E_prev_tmp[i+1]+E_prev_tmp[i-1]-4*E_prev_tmp[i]+E_prev_tmp[i+stride]+E_prev_tmp[i-stride]);
-                E_tmp[i] += -dt*(kk*E_prev_tmp[i]*(E_prev_tmp[i]-a)*(E_prev_tmp[i]-1)+E_prev_tmp[i]*R_tmp[i]);
-                R_tmp[i] += dt*(epsilon+M1* R_tmp[i]/( E_prev_tmp[i]+M2))*(-R_tmp[i]-kk*E_prev_tmp[i]*(E_prev_tmp[i]-b-1));
-        }
-    }
+void solve(double **_E, double **_E_prev, double *R, double alpha, double dt, Plotter *plotter, double &L2, double &Linf) {
+#ifdef _MPI_
+	solveWithMPI(_E, _E_prev, R, alpha, dt, plotter, L2, Linf);
 #else
-    // Solve for the excitation, a PDE
-    for(int j = innerBlockRowStartIndex; j <= innerBlockRowEndIndex; j+=stride) {
-        double *E_tmp = E + j;
-        double *E_prev_tmp = E_prev + j;
-        for(int i = 0; i < cn; i++) {
-            E_tmp[i] = E_prev_tmp[i]+alpha*(E_prev_tmp[i+1]+E_prev_tmp[i-1]-4*E_prev_tmp[i]+E_prev_tmp[i+stride]+E_prev_tmp[i-stride]);
-        }
-    }
-
-    /* 
-     * Solve the ODE, advancing excitation and recovery variables
-     *     to the next timtestep
-     */
-
-    for(int j = innerBlockRowStartIndex; j <= innerBlockRowEndIndex; j+=stride) {
-        double *E_tmp = E + j;
-        double *R_tmp = R + j;
-	    double *E_prev_tmp = E_prev + j;
-        for(int i = 0; i < cn; i++) {
-	  E_tmp[i] += -dt*(kk*E_prev_tmp[i]*(E_prev_tmp[i]-a)*(E_prev_tmp[i]-1)+E_prev_tmp[i]*R_tmp[i]);
-	  R_tmp[i] += dt*(epsilon+M1* R_tmp[i]/( E_prev_tmp[i]+M2))*(-R_tmp[i]-kk*E_prev_tmp[i]*(E_prev_tmp[i]-b-1));
-        }
-    }
+	solveGivenSingleProcess(_E, _E_prev, R, alpha, dt, plotter, L2, Linf);
 #endif
 }
 
-void solve(double **_E, double **_E_prev, double *R, double alpha, double dt, Plotter *plotter, double &L2, double &Linf){
-     double t = 0.0;
 
-    double *E = *_E, *E_prev = *_E_prev;
-    double *R_tmp = R;
-    double *E_tmp = *_E;
-    double *E_prev_tmp = *_E_prev;
-    double mx, sumSq;
-    int niter;
-    int m = cb.m, n=cb.n;
-    int px = cb.px, py=cb.py;
-    int innerBlockRowStartIndex = (n+2)+1;
-    int innerBlockRowEndIndex = (((m+2)*(n+2) - 1) - (n)) - (n+2);
-    
-    int rank;
-    MPI_Comm_rank(MPI_COMM_WORLD,&rank);
+void solveWithMPI(double **_E, double **_E_prev, double *R, double alpha, double dt, Plotter *plotter, double &L2, double &Linf) {
+	// Simulated time is different from the integer timestep number
+	double t = 0.0;
+	double *E = *_E, *E_prev = *_E_prev;
+	double *R_tmp = R;
+	double *E_tmp = *_E;
+	double *E_prev_tmp = *_E_prev;
+	double mx, sumSq;
+	int niter;
+	int m = cb.m, n=cb.n, px = cb.px, py = cb.py;
+	int nprocs, curRank, i, j, extraM = m % py, extraN = n % px;
 
-    const int idx = rank/py;
-    const int idy = rank%py;
-    const int bm = (m+px-1)/px;
-    const int bn = (n+py-1)/py;
-    const int x_b = px-(px*bm-m);
-    const int y_b = py-(py*bn-n);
+	// number of process should less than matrix size
 
-    const int cm = idx<x_b?bm : bm-1;
-    const int cn = idy<y_b?bn:bn-1;
+	//evenly distribute work load
+	MPI_Comm_rank(MPI_COMM_WORLD,&curRank);
+	MPI_Comm_size(MPI_COMM_WORLD,&nprocs);
 
-    const int stride = bn+2;
+	int curRowIdx = curRank / px; 
+	int curColIdx = curRank % px;
+	int subMatM = m / py + 2, subMatN = n / px + 2;
 
-    double *e = alloc1D(bm+2,bn+2);
-    double *ep=alloc1D(bm+2,bn+2);
-    double *r =alloc1D(bm+2,bn+2);
+    subMatM += curRowIdx >= (py - extraM);
+    subMatN += curColIdx >= (px - extraN);
 
-    // for (int i=0;i<m+2;i++){
-    //     for(int j=0;j<n+2;j++){
-    //         cout<<E_prev[i*(n+2)+j]<<";";
-    //     }
-    //     cout<<"\n";
-    // }
-    // cout<<"\n";
-    
-    
-    scatter_mpi(E_prev,ep,R,r,rank,px,py,x_b,y_b,bm,bn,n+2);
+    //printMat2("E_prev", E_prev, subMatM-2, subMatN-2);
+	double* leftPackSend = alloc1D(subMatM, 1);
+	double* leftPackRecv = alloc1D(subMatM, 1);
+	double* rightPackSend = alloc1D(subMatM, 1);
+	double* rightPackRecv = alloc1D(subMatM, 1);
+	// MPI_Irecv(buf, count, type, src, tag, comm, &request)
+	// MPI_Isend(buf, count, type, dest, tag, comm, &request)
+	MPI_Request r10, r20, r30, r40, r11, r21, r31, r41;
+	MPI_Status s10, s20, s30, s40, s11, s21, s31, s41;
 
-    // for (int i=0;i<bm+2;i++){
-    //     for(int j=0;j<bn+2;j++){
-    //         cout<<ep[i*(bn+2)+j]<<";";
-    //     }
-    //     cout<<"\n";
-    // }
+	for (niter = 0; niter < cb.niters; niter++) {
+		if  (cb.debug && (niter==0)){
+			stats(E_prev,m,n,&mx,&sumSq);
+			double l2norm = L2Norm(sumSq);
+			repNorms(l2norm,mx,dt,m,n,-1, cb.stats_freq);
+			if (cb.plot_freq)
+				plotter->updatePlot(E,  -1, m+1, n+1);
+		} 
+		if (!cb.noComm){
+		if (curRowIdx > 0) {
+			MPI_Isend(E_prev + subMatN, subMatN, MPI_DOUBLE, curRank - px, 0, MPI_COMM_WORLD, &r10);
+			MPI_Irecv(E_prev, subMatN, MPI_DOUBLE, curRank - px, 0, MPI_COMM_WORLD, &r11);
+		} else {
+			for (int i = 0; i < subMatN; i++) {
+				E_prev[i] = E_prev[i + 2 * subMatN];
+			}
+		}
 
-    for (niter = 0; niter < cb.niters; niter++){
-        if  (cb.debug && (niter==0)){
-	        stats(E_prev,m,n,&mx,&sumSq);
-            double l2norm = L2Norm(sumSq);
-	        repNorms(l2norm,mx,dt,m,n,-1, cb.stats_freq);
-	        // if (cb.plot_freq)
-	        // plotter->updatePlot(E,  -1, m+1, n+1);
-        }
-        
-        // if (rank==1){
-        // for (int i=0;i<bm+2;i++){
-        //     for(int j=0;j<bn+2;j++){
-        //         cout<<ep[i*(bn+2)+j]<<";";
-        //     }
-        //     cout<<"\n";
-        // }
-        // cout<<"\n";
-        // }
+		if (curRowIdx < py - 1) {
+			MPI_Isend(E_prev + subMatN * (subMatM-2), subMatN, MPI_DOUBLE, curRank + px, 0, MPI_COMM_WORLD, &r20);
+			MPI_Irecv(E_prev + subMatN * (subMatM-1), subMatN, MPI_DOUBLE, curRank + px, 0, MPI_COMM_WORLD, &r21);
+		} else {
+			int base1 = subMatN * (subMatM-1);
+			int base2 = subMatN * (subMatM-3);
+			for (int i = 0; i < subMatN; i++) {
+				E_prev[base1 + i] = E_prev[base2 + i];
+			}
+		}
 
-        // Communicate(ep,idx,idy,px,py,bm,bn,cm,cn);
+		if (curColIdx > 0) {
+			for (int i = 0; i < subMatM; i++) {
+				leftPackSend[i] = E_prev[i*subMatN + 1];
+			}
+			MPI_Isend(leftPackSend, subMatM, MPI_DOUBLE, curRank - 1, 0, MPI_COMM_WORLD, &r30);
+			MPI_Irecv(leftPackRecv, subMatM, MPI_DOUBLE, curRank - 1, 0, MPI_COMM_WORLD, &r31);
+		} else {
+			for (int i = 0; i < subMatM; i++) {
+				E_prev[i*subMatN] = E_prev[i*subMatN + 2];
+			}
+		}
 
-    MPI_Request recv_req[4], send_req[4];
-    MPI_Status recv_status[4], send_status[4];
-    int stride=bn+2;
-    MPI_Datatype col_type;
-    MPI_Type_vector(cm,1,stride,MPI_DOUBLE,&col_type);
-    MPI_Type_commit(&col_type);
-    double *e_prev=ep;
-    int x=idx;
-    int y=idy;
-#define RANK(x, y) ((x)*cb.py+(y))
-    double *top_pad = e_prev + 1;
-            double *top_row = top_pad + stride;
-            if (x == 0) {
-                copy_mat(top_row + stride, top_pad, 1, cn);
-            } else {
-                MPI_Isend(top_row, cn, MPI_DOUBLE, RANK(x - 1, y), TAG_TOP, MPI_COMM_WORLD, &send_req[0]);
-                MPI_Irecv(top_pad, cn, MPI_DOUBLE, RANK(x - 1, y), TAG_BOTTOM, MPI_COMM_WORLD, &recv_req[0]);
-            }
+		if (curColIdx < px - 1) {
+			for (int i = 1; i <= subMatM; i++) {
+				rightPackSend[i-1] = E_prev[i*subMatN - 2];
+			}
+			MPI_Isend(rightPackSend, subMatM, MPI_DOUBLE, curRank + 1, 0, MPI_COMM_WORLD, &r40);
+			MPI_Irecv(rightPackRecv, subMatM, MPI_DOUBLE, curRank + 1, 0, MPI_COMM_WORLD, &r41);
+		} else {
+			for (int i = 1; i <= subMatM; i++) {
+				E_prev[i * subMatN-1] = E_prev[i * subMatN-3];
+			}
+		}
+		}
 
-            // Bottom cells
-            double *bottom_pad = e_prev + (cm + 1) * stride + 1;
-            double *bottom_row = bottom_pad - stride;
-            if (x == cb.px - 1) {
-                copy_mat(bottom_row - stride, bottom_pad, 1, cn);
-            } else {
-                MPI_Isend(bottom_row, cn, MPI_DOUBLE, RANK(x + 1, y), TAG_BOTTOM, MPI_COMM_WORLD, &send_req[1]);
-                MPI_Irecv(bottom_pad, cn, MPI_DOUBLE, RANK(x + 1, y), TAG_TOP, MPI_COMM_WORLD, &recv_req[1]);
-            }
+//////////////////////////////////////////////////////////////////////////////
+		int innerBlockRowStartIndex = 2 * subMatN + 1, innerBlockRowEndIndex = subMatN * (subMatM - 3) + 1;
+		int j = 0;
+#define FUSED 1
+#ifdef FUSED
+		// Solve for the excitation, a PDE
+		for(j = innerBlockRowStartIndex; j <= innerBlockRowEndIndex; j+=subMatN) {
+			E_tmp = E + j;
+			E_prev_tmp = E_prev + j;
+			R_tmp = R + j;
+			register double ePrevTmpInRegister, rTmpInRegister;
+			for(i = 1; i < subMatN - 3; i++) {
+				ePrevTmpInRegister = E_prev_tmp[i];
+				rTmpInRegister = R_tmp[i];
+				E_tmp[i] = ePrevTmpInRegister + alpha * (E_prev_tmp[i+1]+E_prev_tmp[i-1]-4*ePrevTmpInRegister+E_prev_tmp[i+subMatN]+E_prev_tmp[i-subMatN]);
+				E_tmp[i] += -dt*(kk* ePrevTmpInRegister *(ePrevTmpInRegister-a)*(ePrevTmpInRegister-1)+ePrevTmpInRegister*rTmpInRegister);
+				R_tmp[i] += dt*(epsilon+M1* rTmpInRegister/( ePrevTmpInRegister+M2))*(-rTmpInRegister-kk* ePrevTmpInRegister *(ePrevTmpInRegister-b-1));
+			}
+		}
+#else
+		// Solve for the excitation, a PDE
+		for(j = innerBlockRowStartIndex; j <= innerBlockRowEndIndex; j+=subMatN) {
+			E_tmp = E + j;
+			E_prev_tmp = E_prev + j;
+			for(i = 1; i < subMatN - 3; i++) {
+				E_tmp[i] = E_prev_tmp[i]+alpha*(E_prev_tmp[i+1]+E_prev_tmp[i-1]-4*E_prev_tmp[i]+E_prev_tmp[i+subMatN]+E_prev_tmp[i-subMatN]);
+			}
+		}
+		/* 
+		 * Solve the ODE, advancing excitation and recovery variables
+		 *     to the next timtestep
+		 */
+		for(j = innerBlockRowStartIndex; j <= innerBlockRowEndIndex; j+=subMatN) {
+			E_tmp = E + j;
+			R_tmp = R + j;
+			E_prev_tmp = E_prev + j;
+			for(i = 1; i < subMatN - 3; i++) {
+				E_tmp[i] += -dt*(kk*E_prev_tmp[i]*(E_prev_tmp[i]-a)*(E_prev_tmp[i]-1)+E_prev_tmp[i]*R_tmp[i]);
+				R_tmp[i] += dt*(epsilon+M1* R_tmp[i]/( E_prev_tmp[i]+M2))*(-R_tmp[i]-kk*E_prev_tmp[i]*(E_prev_tmp[i]-b-1));
+			}
+		}
+#endif
+		if (!cb.noComm){
+		if (curRowIdx > 0) {
+			MPI_Wait(&r10, &s10);
+			MPI_Wait(&r11, &s11);
+		} 
 
-            // Left cells
-            double *left_pad = e_prev + stride;
-            double *left_col = left_pad + 1;
-            if (y == 0) {
-                copy_mat(left_col + 1, left_pad, stride, cm);
-            } else {
-                MPI_Isend(left_col, 1, col_type, RANK(x, y - 1), TAG_LEFT, MPI_COMM_WORLD, &send_req[2]);
-                MPI_Irecv(left_pad, 1, col_type, RANK(x, y - 1), TAG_RIGHT, MPI_COMM_WORLD, &recv_req[2]);
-            }
+		if (curRowIdx < py - 1) {
+			MPI_Wait(&r20, &s20);
+			MPI_Wait(&r21, &s21);
+		}
 
-            // Right cells
-            double *right_pad = e_prev + stride + cn + 1;
-            double *right_col = right_pad - 1;
-            if (y == cb.py - 1) {
-                copy_mat(right_col - 1, right_pad, stride, cm);
-            } else {
-                MPI_Isend(right_col, 1, col_type, RANK(x, y + 1), TAG_RIGHT, MPI_COMM_WORLD, &send_req[3]);
-                MPI_Irecv(right_pad, 1, col_type, RANK(x, y + 1), TAG_LEFT, MPI_COMM_WORLD, &recv_req[3]);
-            }
+		if (curColIdx > 0) {
+			MPI_Wait(&r30, &s30);
+			MPI_Wait(&r31, &s31);
+			for (int i = 0; i < subMatM; i++) {
+				E_prev[i * subMatN] = leftPackRecv[i];
+			}
+		} 
 
-    if(idx>0){
-        MPI_Wait(&send_req[0],&send_status[0]);
-        MPI_Wait(&recv_req[0],&recv_status[0]);
-    }
-    if (idx<px-1){
-        MPI_Wait(&send_req[1],&send_status[1]);
-        MPI_Wait(&recv_req[1],&recv_status[1]);
-    }
-    if(idy>0){
-        MPI_Wait(&send_req[2],&send_status[2]);
-        MPI_Wait(&recv_req[2],&recv_status[2]);
-    }
-    if(idy<py-1){
-        MPI_Wait(&send_req[3],&send_status[3]);
-        MPI_Wait(&recv_req[3],&recv_status[3]);
-    }
+		if (curColIdx < px - 1) {
+			MPI_Wait(&r40, &s40);
+			MPI_Wait(&r41, &s41);
+			for (int i = 1; i <= subMatM; i++) {
+				E_prev[i * subMatN-1] = rightPackRecv[i-1];
+			}
+		}
+		}
+		
+		 /////////////////////////////////////////////////////////////////////////////////
+#ifdef FUSED
+		E_tmp = E + (subMatN + 1);
+		E_prev_tmp = E_prev + (subMatN + 1);
+		R_tmp = R + (subMatN + 1);
+		register double ePrevTmpInRegister, rTmpInRegister;
+		for(i = 1; i < subMatN - 3; i++) {
+			ePrevTmpInRegister = E_prev_tmp[i];
+			rTmpInRegister = R_tmp[i];
+			E_tmp[i] = ePrevTmpInRegister + alpha * (E_prev_tmp[i+1]+E_prev_tmp[i-1]-4*ePrevTmpInRegister+E_prev_tmp[i+subMatN]+E_prev_tmp[i-subMatN]);
+			E_tmp[i] += -dt*(kk* ePrevTmpInRegister *(ePrevTmpInRegister-a)*(ePrevTmpInRegister-1)+ePrevTmpInRegister*rTmpInRegister);
+			R_tmp[i] += dt*(epsilon+M1* rTmpInRegister/( ePrevTmpInRegister+M2))*(-rTmpInRegister-kk* ePrevTmpInRegister *(ePrevTmpInRegister-b-1));
+		}
+		E_tmp = E + (subMatN * (subMatM - 2) + 1);
+		E_prev_tmp = E_prev + (subMatN * (subMatM - 2) + 1);
+		R_tmp = R + (subMatN * (subMatM - 2) + 1);
+		for(i = 1; i < subMatN - 3; i++) {
+			ePrevTmpInRegister = E_prev_tmp[i];
+			rTmpInRegister = R_tmp[i];
+			E_tmp[i] = ePrevTmpInRegister + alpha * (E_prev_tmp[i+1]+E_prev_tmp[i-1]-4*ePrevTmpInRegister+E_prev_tmp[i+subMatN]+E_prev_tmp[i-subMatN]);
+			E_tmp[i] += -dt*(kk* ePrevTmpInRegister *(ePrevTmpInRegister-a)*(ePrevTmpInRegister-1)+ePrevTmpInRegister*rTmpInRegister);
+			R_tmp[i] += dt*(epsilon+M1* rTmpInRegister/( ePrevTmpInRegister+M2))*(-rTmpInRegister-kk* ePrevTmpInRegister *(ePrevTmpInRegister-b-1));
+		}
+		innerBlockRowStartIndex = subMatN + 1;
+		innerBlockRowEndIndex = subMatN * (subMatM - 2) + 1;
+		for(j = innerBlockRowStartIndex; j <= innerBlockRowEndIndex; j+=subMatN) {
+			E_tmp = E + j;
+			E_prev_tmp = E_prev + j;
+			R_tmp = R + j;
+			i = 0;
+			ePrevTmpInRegister = E_prev_tmp[i];
+			rTmpInRegister = R_tmp[i];
+			E_tmp[i] = ePrevTmpInRegister + alpha * (E_prev_tmp[i+1]+E_prev_tmp[i-1]-4*ePrevTmpInRegister+E_prev_tmp[i+subMatN]+E_prev_tmp[i-subMatN]);
+			E_tmp[i] += -dt*(kk* ePrevTmpInRegister *(ePrevTmpInRegister-a)*(ePrevTmpInRegister-1)+ePrevTmpInRegister*rTmpInRegister);
+			R_tmp[i] += dt*(epsilon+M1* rTmpInRegister/( ePrevTmpInRegister+M2))*(-rTmpInRegister-kk* ePrevTmpInRegister *(ePrevTmpInRegister-b-1));
+			i = subMatN - 3;
+			ePrevTmpInRegister = E_prev_tmp[i];
+			rTmpInRegister = R_tmp[i];
+			E_tmp[i] = ePrevTmpInRegister + alpha * (E_prev_tmp[i+1]+E_prev_tmp[i-1]-4*ePrevTmpInRegister+E_prev_tmp[i+subMatN]+E_prev_tmp[i-subMatN]);
+			E_tmp[i] += -dt*(kk* ePrevTmpInRegister *(ePrevTmpInRegister-a)*(ePrevTmpInRegister-1)+ePrevTmpInRegister*rTmpInRegister);
+			R_tmp[i] += dt*(epsilon+M1* rTmpInRegister/( ePrevTmpInRegister+M2))*(-rTmpInRegister-kk* ePrevTmpInRegister *(ePrevTmpInRegister-b-1));			
+		}
+#endif
 
-        // if (rank==1){
-        // for (int i=0;i<bm+2;i++){
-        //     for(int j=0;j<bn+2;j++){
-        //         cout<<ep[i*(bn+2)+j]<<";";
-        //     }
-        //     cout<<"\n";
-        // }
-        // cout<<"\n";
-        // }
-        
-        compute_AP(e,ep,r,alpha,dt,stride,cm,cn);
+		if (cb.stats_freq){
+			 if ( !(niter % cb.stats_freq)){
+				stats(E,subMatM-2,subMatN-2,&mx,&sumSq);
+				double l2norm = L2Norm(sumSq);
+				repNorms(l2norm,mx,dt,m,n,niter, cb.stats_freq);
+			}
+		}
 
-        // if (rank==0){
-        // for (int i=0;i<bm+2;i++){
-        //     for(int j=0;j<bn+2;j++){
-        //         cout<<e[i*(bn+2)+j]<<";";
-        //     }
-        //     cout<<"\n";
-        // }
-        // cout<<"\n";
-        // }
+		if (cb.plot_freq){
+			if (!(niter % cb.plot_freq)){
+				plotter->updatePlot(E,  niter, m, n);
+			}
+		}
 
-        if (cb.stats_freq){
-            if ( !(niter % cb.stats_freq)){
-                stats_mpi(ep,rank,cm,cn,stride,&mx,&sumSq);
-                double l2norm = L2Norm(sumSq);
-                repNorms(l2norm,mx,dt,m,n,niter, cb.stats_freq);}}
+		// Swap current and previous meshes
+		double *tmp = E; E = E_prev; E_prev = tmp;
 
-        // if (cb.plot_freq){
-        //     if (!(niter % cb.plot_freq)){
-	    //     plotter->updatePlot(E,  niter, m, n);}}
+	}
 
-    // Swap current and previous meshes
-    double *tmp = e; e = ep; ep = tmp;
-    }
-
-    stats_mpi(ep,rank,cm,cn,stride,&Linf,&sumSq);
-    // stats(E_prev,m,n,&Linf,&sumSq);
-    L2 = L2Norm(sumSq);
-
-    
-
-    // Swap pointers so we can re-use the arrays
-    *_E = E;
-    *_E_prev = E_prev;
+	stats(E_prev, subMatM - 2, subMatN - 2, &Linf, &sumSq);
+    double curLinf, curSumSq;
+    MPI_Reduce(&Linf, &curLinf, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+    MPI_Reduce(&sumSq, &curSumSq, 1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
+    Linf = curLinf;
+    sumSq = curSumSq;
+	L2 = L2Norm(sumSq);
+	// Swap pointers so we can re-use the arrays
+	*_E = E;
+	*_E_prev = E_prev;
 
 }
 
-void solve_origin(double **_E, double **_E_prev, double *R, double alpha, double dt, Plotter *plotter, double &L2, double &Linf){
+void solveGivenSingleProcess(double **_E, double **_E_prev, double *R, double alpha, double dt, Plotter *plotter, double &L2, double &Linf){
 
  // Simulated time is different from the integer timestep number
  double t = 0.0;
@@ -452,141 +307,142 @@ void solve_origin(double **_E, double **_E_prev, double *R, double alpha, double
 
  // We continue to sweep over the mesh until the simulation has reached
  // the desired number of iterations
-  for (niter = 0; niter < cb.niters; niter++){
-  
-      if  (cb.debug && (niter==0)){
-	  stats(E_prev,m,n,&mx,&sumSq);
-          double l2norm = L2Norm(sumSq);
-	  repNorms(l2norm,mx,dt,m,n,-1, cb.stats_freq);
-	  if (cb.plot_freq)
-	      plotter->updatePlot(E,  -1, m+1, n+1);
-      }
+	for (niter = 0; niter < cb.niters; niter++){
+	
+		if  (cb.debug && (niter==0)){
+			stats(E_prev,m,n,&mx,&sumSq);
+			double l2norm = L2Norm(sumSq);
+			repNorms(l2norm,mx,dt,m,n,-1, cb.stats_freq);
+			if (cb.plot_freq)
+				plotter->updatePlot(E,  -1, m+1, n+1);
+		}
 
-   /* 
-    * Copy data from boundary of the computational box to the
-    * padding region, set up for differencing computational box's boundary
-    *
-    * These are physical boundary conditions, and are not to be confused
-    * with ghost cells that we would use in an MPI implementation
-    *
-    * The reason why we copy boundary conditions is to avoid
-    * computing single sided differences at the boundaries
-    * which increase the running time of solve()
-    *
-    */
-    
-    // 4 FOR LOOPS set up the padding needed for the boundary conditions
-    int i,j;
+	 /* 
+		* Copy data from boundary of the computational box to the
+		* padding region, set up for differencing computational box's boundary
+		*
+		* These are physical boundary conditions, and are not to be confused
+		* with ghost cells that we would use in an MPI implementation
+		*
+		* The reason why we copy boundary conditions is to avoid
+		* computing single sided differences at the boundaries
+		* which increase the running time of solve()
+		*
+		*/
+		
+		// 4 FOR LOOPS set up the padding needed for the boundary conditions
+		int i,j;
 
-    // Fills in the TOP Ghost Cells
-    for (i = 0; i < (n+2); i++) {
-        E_prev[i] = E_prev[i + (n+2)*2];
-    }
+		// Fills in the TOP Ghost Cells
+		for (i = 0; i < (n+2); i++) {
+			E_prev[i] = E_prev[i + (n+2)*2];
+		}
 
-    // Fills in the RIGHT Ghost Cells
-    for (i = (n+1); i < (m+2)*(n+2); i+=(n+2)) {
-        E_prev[i] = E_prev[i-2];
-    }
+		// Fills in the RIGHT Ghost Cells
+		for (i = (n+1); i < (m+2)*(n+2); i+=(n+2)) {
+			E_prev[i] = E_prev[i-2];
+		}
 
-    // Fills in the LEFT Ghost Cells
-    for (i = 0; i < (m+2)*(n+2); i+=(n+2)) {
-        E_prev[i] = E_prev[i+2];
-    }	
+		// Fills in the LEFT Ghost Cells
+		for (i = 0; i < (m+2)*(n+2); i+=(n+2)) {
+			E_prev[i] = E_prev[i+2];
+		}	
 
-    // Fills in the BOTTOM Ghost Cells
-    for (i = ((m+2)*(n+2)-(n+2)); i < (m+2)*(n+2); i++) {
-        E_prev[i] = E_prev[i - (n+2)*2];
-    }
+		// Fills in the BOTTOM Ghost Cells
+		for (i = ((m+2)*(n+2)-(n+2)); i < (m+2)*(n+2); i++) {
+			E_prev[i] = E_prev[i - (n+2)*2];
+		}
 
 //////////////////////////////////////////////////////////////////////////////
 
 #define FUSED 1
 
 #ifdef FUSED
-    // Solve for the excitation, a PDE
-    for(j = innerBlockRowStartIndex; j <= innerBlockRowEndIndex; j+=(n+2)) {
-        E_tmp = E + j;
-	    E_prev_tmp = E_prev + j;
-        R_tmp = R + j;
-	for(i = 0; i < n; i++) {
-	    E_tmp[i] = E_prev_tmp[i]+alpha*(E_prev_tmp[i+1]+E_prev_tmp[i-1]-4*E_prev_tmp[i]+E_prev_tmp[i+(n+2)]+E_prev_tmp[i-(n+2)]);
-            E_tmp[i] += -dt*(kk*E_prev_tmp[i]*(E_prev_tmp[i]-a)*(E_prev_tmp[i]-1)+E_prev_tmp[i]*R_tmp[i]);
-            R_tmp[i] += dt*(epsilon+M1* R_tmp[i]/( E_prev_tmp[i]+M2))*(-R_tmp[i]-kk*E_prev_tmp[i]*(E_prev_tmp[i]-b-1));
-        }
-    }
+		// Solve for the excitation, a PDE
+		for(j = innerBlockRowStartIndex; j <= innerBlockRowEndIndex; j+=(n+2)) {
+			E_tmp = E + j;
+			E_prev_tmp = E_prev + j;
+			R_tmp = R + j;
+			for(i = 0; i < n; i++) {
+				E_tmp[i] = E_prev_tmp[i]+alpha*(E_prev_tmp[i+1]+E_prev_tmp[i-1]-4*E_prev_tmp[i]+E_prev_tmp[i+(n+2)]+E_prev_tmp[i-(n+2)]);
+				E_tmp[i] += -dt*(kk*E_prev_tmp[i]*(E_prev_tmp[i]-a)*(E_prev_tmp[i]-1)+E_prev_tmp[i]*R_tmp[i]);
+				R_tmp[i] += dt*(epsilon+M1* R_tmp[i]/( E_prev_tmp[i]+M2))*(-R_tmp[i]-kk*E_prev_tmp[i]*(E_prev_tmp[i]-b-1));
+			}
+		}
 #else
-    // Solve for the excitation, a PDE
-    for(j = innerBlockRowStartIndex; j <= innerBlockRowEndIndex; j+=(n+2)) {
-        E_tmp = E + j;
-            E_prev_tmp = E_prev + j;
-            for(i = 0; i < n; i++) {
-                E_tmp[i] = E_prev_tmp[i]+alpha*(E_prev_tmp[i+1]+E_prev_tmp[i-1]-4*E_prev_tmp[i]+E_prev_tmp[i+(n+2)]+E_prev_tmp[i-(n+2)]);
-            }
-    }
+		// Solve for the excitation, a PDE
+		for(j = innerBlockRowStartIndex; j <= innerBlockRowEndIndex; j+=(n+2)) {
+			E_tmp = E + j;
+			E_prev_tmp = E_prev + j;
+			for(i = 0; i < n; i++) {
+				E_tmp[i] = E_prev_tmp[i]+alpha*(E_prev_tmp[i+1]+E_prev_tmp[i-1]-4*E_prev_tmp[i]+E_prev_tmp[i+(n+2)]+E_prev_tmp[i-(n+2)]);
+			}
+		}
 
-    /* 
-     * Solve the ODE, advancing excitation and recovery variables
-     *     to the next timtestep
-     */
+		/* 
+		 * Solve the ODE, advancing excitation and recovery variables
+		 *     to the next timtestep
+		 */
 
-    for(j = innerBlockRowStartIndex; j <= innerBlockRowEndIndex; j+=(n+2)) {
-        E_tmp = E + j;
-        R_tmp = R + j;
-	E_prev_tmp = E_prev + j;
-        for(i = 0; i < n; i++) {
-	  E_tmp[i] += -dt*(kk*E_prev_tmp[i]*(E_prev_tmp[i]-a)*(E_prev_tmp[i]-1)+E_prev_tmp[i]*R_tmp[i]);
-	  R_tmp[i] += dt*(epsilon+M1* R_tmp[i]/( E_prev_tmp[i]+M2))*(-R_tmp[i]-kk*E_prev_tmp[i]*(E_prev_tmp[i]-b-1));
-        }
-    }
+		for(j = innerBlockRowStartIndex; j <= innerBlockRowEndIndex; j+=(n+2)) {
+			E_tmp = E + j;
+			R_tmp = R + j;
+			E_prev_tmp = E_prev + j;
+			for(i = 0; i < n; i++) {
+				E_tmp[i] += -dt*(kk*E_prev_tmp[i]*(E_prev_tmp[i]-a)*(E_prev_tmp[i]-1)+E_prev_tmp[i]*R_tmp[i]);
+				R_tmp[i] += dt*(epsilon+M1* R_tmp[i]/( E_prev_tmp[i]+M2))*(-R_tmp[i]-kk*E_prev_tmp[i]*(E_prev_tmp[i]-b-1));
+			}
+		}
 #endif
-     /////////////////////////////////////////////////////////////////////////////////
+		 /////////////////////////////////////////////////////////////////////////////////
 
-   if (cb.stats_freq){
-     if ( !(niter % cb.stats_freq)){
-        stats(E,m,n,&mx,&sumSq);
-        double l2norm = L2Norm(sumSq);
-        repNorms(l2norm,mx,dt,m,n,niter, cb.stats_freq);
-    }
-   }
+		if (cb.stats_freq){
+			 if ( !(niter % cb.stats_freq)){
+				stats(E,m,n,&mx,&sumSq);
+				double l2norm = L2Norm(sumSq);
+				repNorms(l2norm,mx,dt,m,n,niter, cb.stats_freq);
+			}
+		}
 
-   if (cb.plot_freq){
-          if (!(niter % cb.plot_freq)){
-	    plotter->updatePlot(E,  niter, m, n);
-        }
-    }
+		if (cb.plot_freq){
+			if (!(niter % cb.plot_freq)){
+				plotter->updatePlot(E,  niter, m, n);
+			}
+		}
 
-   // Swap current and previous meshes
-   double *tmp = E; E = E_prev; E_prev = tmp;
+		// Swap current and previous meshes
+		double *tmp = E; E = E_prev; E_prev = tmp;
 
- } //end of 'niter' loop at the beginning
+ 	} //end of 'niter' loop at the beginning
 
-  //  printMat2("Rank 0 Matrix E_prev", E_prev, m,n);  // return the L2 and infinity norms via in-out parameters
+	//  printMat2("Rank 0 Matrix E_prev", E_prev, m,n);  // return the L2 and infinity norms via in-out parameters
 
-  stats(E_prev,m,n,&Linf,&sumSq);
-  L2 = L2Norm(sumSq);
+	stats(E_prev,m,n,&Linf,&sumSq);
+	L2 = L2Norm(sumSq);
 
-  // Swap pointers so we can re-use the arrays
-  *_E = E;
-  *_E_prev = E_prev;
+	// Swap pointers so we can re-use the arrays
+	*_E = E;
+	*_E_prev = E_prev;
 }
 
 void printMat2(const char mesg[], double *E, int m, int n){
-    int i;
+		int i;
 #if 0
-    if (m>8)
-      return;
+		if (m>8)
+			return;
 #else
-    if (m>34)
-      return;
+		if (m>34)
+			return;
 #endif
-    printf("%s\n",mesg);
-    for (i=0; i < (m+2)*(n+2); i++){
-       int rowIndex = i / (n+2);
-       int colIndex = i % (n+2);
-       if ((colIndex>0) && (colIndex<n+1))
-          if ((rowIndex > 0) && (rowIndex < m+1))
-            printf("%6.3f ", E[i]);
-       if (colIndex == n+1)
-	    printf("\n");
-    }
+		printf("%s\n",mesg);
+		for (i=0; i < (m+2)*(n+2); i++){
+			int rowIndex = i / (n+2);
+			int colIndex = i % (n+2);
+			if ((colIndex>0) && (colIndex<n+1))
+				if ((rowIndex > 0) && (rowIndex < m+1))
+					printf("%6.3f ", E[i]);
+			if (colIndex == n+1)
+			printf("\n");
+		}
 }
+

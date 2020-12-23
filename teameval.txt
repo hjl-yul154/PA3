@@ -13,33 +13,44 @@ If you worked alone leave column B blank
 
 (1) List the names of your team members:
 
-A:
+A: Yuxiao Liang
 
  
-B:
+B: Zerui Wei
 
  
  
 (2) Estimate how much time each team member devoted to this project, in HOURS.
 
   	                        A 	       B
-meetings 	  	  	 
-coding 	  	  	 
-writeup 	  	  	 
-planning (alone) 	  	  	 
-total (including meetings) 	  	  	 
+meetings                    5          5
+coding                      10         20
+writeup                     3          3
+planning (alone)            5          5
+total (including meetings)  23  	  	 33
 
 
 (3) Discuss the following.
 (a) If you worked in a team, what were the major responsibilities
     of each team member?
+    Yuxiao Liang: Conduct various experiments on Comet. Write the report.
+    Zerui Wei: Implemnt the main code. Write the report.
 (b) Did you complete the assignment?
+    Yes
 (c) What were your major strengths and weaknesses in doing this
     assignment (individually or in a team)?
+    Yuxiao Liang: strengths: Clear understanding of the algorithm
+                  weaknesses: Wasn't familiar with the server environment and tools.
+    Zerui Wei: strengths: good coding ability.
+               weaknesses: Wasn't familiar with the server environment and tools.
     If in a team, also discuss how your team worked together.
+    We worked together well.
 (d) What  lessons did you learn from these events.
+    The algorithm to do MPI and how do cores work together.
 (e) If in a team, whether and how you plan to change the way
     your work together .
+    We discussed very frequently, planed every step well.
 (f) Anything else that comes to mind.
+    No.
 
 
